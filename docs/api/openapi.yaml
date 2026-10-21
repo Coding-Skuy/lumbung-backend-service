@@ -33,8 +33,8 @@ info:
 servers:
   - url: https://api.lumbung.chefgenie.id/v1
     description: Produksi
-  - url: http://localhost:8080
-    description: Lokal (cargo run)
+  - url: http://localhost:8080/v1
+    description: Lokal (cargo run); semua rute API ada di bawah awalan /v1 (selain /healthz untuk infra).
 tags:
   - name: Sistem
     description: Kesehatan layanan.
@@ -83,7 +83,9 @@ paths:
       description: |
         Akun peran (contoh `sopir-02`, `PTN-007`) + PIN 6 digit. Tiga kali salah PIN mengunci akun
         15 menit. Mengembalikan JWT akses 15 menit (ed25519, audiens `lumbung`) dan refresh 7 hari.
-        Tidak ada login hanya dengan nama; 1 orang 1 akun.
+        Tidak ada login hanya dengan nama; 1 orang 1 akun. PIN salah dan akun tidak ada sama-sama
+        `401` (tanpa membocorkan keberadaan akun). Akun yang sedang terkunci mendapat `429` dengan
+        pesan `akun terkunci sampai <waktu>` walau PIN benar. Format PIN salah `422`, JSON rusak `400`.
       security: []
       parameters:
         - $ref: '#/components/parameters/PerangkatId'
@@ -108,7 +110,7 @@ paths:
         '422':
           $ref: '#/components/responses/Validasi'
         '429':
-          $ref: '#/components/responses/BatasLaju'
+          $ref: '#/components/responses/AkunTerkunci'
         '500':
           $ref: '#/components/responses/GalatServer'
 
@@ -121,6 +123,7 @@ paths:
         Menukar refresh token (7 hari) dengan JWT akses baru dan refresh baru (rotasi). Bila refresh
         token lama dipakai dua kali (reuse-detection), seluruh keluarga refresh pengguna dicabut dan
         pengguna wajib masuk ulang (`401`). Klien mobile me-refresh otomatis 1 kali lalu meminta login ulang.
+        Refresh token berformat opak `<id>.<rahasia>`; klien menyimpannya apa adanya.
       security: []
       requestBody:
         required: true
@@ -145,7 +148,7 @@ paths:
       tags: [Auth]
       operationId: authKeluar
       summary: Keluar (cabut keluarga refresh)
-      description: Menghapus keluarga refresh dari basis data; token akses kedaluwarsa sendiri dalam 15 menit.
+      description: Menghapus keluarga refresh sesi ini dari basis data (sesi perangkat lain tidak terpengaruh); token akses kedaluwarsa sendiri dalam 15 menit.
       responses:
         '204':
           description: Berhasil keluar.
@@ -162,7 +165,8 @@ paths:
       description: |
         Kredensial perangkat gudang terdaftar (`X-Device-Key`) + PIN operator per shift (contoh
         `OPR-SORTIR-1`). Mengembalikan token shift berumur 12 jam. Token shift tidak boleh keluar dari
-        PC gudang. Tiga salah PIN mengunci 15 menit dan memberi tahu Kepala Agregasi.
+        PC gudang. Tiga salah PIN mengunci 15 menit (`429`) dan tercatat di audit (`akun_terkunci`) untuk
+        Kepala Agregasi. Kunci perangkat salah atau kedaluwarsa `401`; akun yang bukan operator gudang `403`.
       security:
         - deviceKey: []
       parameters:
@@ -190,7 +194,7 @@ paths:
         '422':
           $ref: '#/components/responses/Validasi'
         '429':
-          $ref: '#/components/responses/BatasLaju'
+          $ref: '#/components/responses/AkunTerkunci'
         '500':
           $ref: '#/components/responses/GalatServer'
 
@@ -199,7 +203,7 @@ paths:
       tags: [Gudang]
       operationId: gudangKeluar
       summary: Tutup shift gudang
-      description: Wajib dipanggil tiap tutup shift 14.00; mencabut token shift.
+      description: Wajib dipanggil tiap tutup shift 14.00; mencabut token shift. Hanya token shift yang diterima (token akses biasa `401`).
       security:
         - bearerAuth: []
           deviceKey: []
@@ -522,7 +526,9 @@ paths:
       tags: [Petani]
       operationId: papanHargaPetani
       summary: Papan harga minggu berjalan (baca saja)
-      description: Petani tidak dapat mengubah harga.
+      description: |
+        Petani tidak dapat mengubah harga. Perlu login (bearer); cache hanya privat
+        (`Cache-Control: private, max-age=900`). `404` bila papan minggu berjalan belum terbit.
       parameters:
         - $ref: '#/components/parameters/PerangkatId'
       responses:
@@ -536,6 +542,8 @@ paths:
           $ref: '#/components/responses/TidakSah'
         '403':
           $ref: '#/components/responses/Ditolak'
+        '404':
+          $ref: '#/components/responses/TidakDitemukan'
         '500':
           $ref: '#/components/responses/GalatServer'
 
@@ -841,7 +849,10 @@ paths:
       tags: [Publik]
       operationId: publikPapanHarga
       summary: Papan harga publik minggu berjalan
-      description: Tanpa login; boleh di-cache CDN 15 menit. Berlaku Senin-Minggu; dihitung Jumat 15.00, publikasi maksimal 17.00.
+      description: |
+        Tanpa login; boleh di-cache CDN 15 menit (`Cache-Control: public, max-age=900`). Berlaku Senin-Minggu;
+        dihitung Jumat 15.00, publikasi maksimal 17.00. `404` bila papan minggu berjalan belum diterbitkan
+        (klien menampilkan "belum terbit"; tidak ada papan minggu lain yang dipakai sebagai pengganti).
       security: []
       responses:
         '200':
@@ -862,6 +873,8 @@ paths:
                 kangkung: {a: 6000, b: 5000}
                 fee: {dekat: 1500, jauh: 2500}
                 berlaku: '2026-10-06 s.d. 2026-10-12'
+        '404':
+          $ref: '#/components/responses/TidakDitemukan'
         '429':
           $ref: '#/components/responses/BatasLaju'
         '500':
@@ -1029,7 +1042,11 @@ paths:
       summary: Terbitkan papan harga Jumat 15.00
       description: |
         3 komoditas x 2 grade + 2 zona fee. Formula: median 3 harga referensi dikurangi 10 persen buffer,
-        dibulatkan ke bawah kelipatan Rp500 (dihitung server). Beraudit nama + waktu; mengembalikan `audit_id`.
+        dibulatkan ke bawah kelipatan Rp500 (dihitung server); Grade B = 85 persen Grade A dibulatkan ke bawah
+        kelipatan Rp500; fee 2 zona tetap dari server. Hanya peran `admin_gudang` atau `X-Service-Key` (web) yang
+        diizinkan; peran lain `403` dan dicatat. Beraudit nama + waktu; mengembalikan `audit_id`. Satu papan per
+        minggu: papan kedua untuk `berlaku_mulai` yang sama dengan `uuid` berbeda `409`. Bidang selain yang
+        terdaftar (contoh `fee`, `harga`) ditolak `422`: klien tidak mengirim angka hitungan server.
       security:
         - bearerAuth: []
         - serviceKey: []
@@ -1040,6 +1057,15 @@ paths:
             schema:
               $ref: '#/components/schemas/TerbitPapanRequest'
       responses:
+        '200':
+          description: UUID klien sudah pernah diproses; `audit_id` pertama dikembalikan dengan `duplikat` true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditHasil'
+              example:
+                audit_id: AUD-20261009-003
+                duplikat: true
         '201':
           description: Papan diterbitkan.
           content:
@@ -1151,8 +1177,9 @@ components:
       in: header
       name: X-Device-Key
       description: |
-        API key perangkat gudang terdaftar (`DEVICE_API_KEY_GUDANG`). Hak minimal; tidak boleh membaca
-        data pengguna. Rotasi 90 hari, kunci lama diberi tenggang 7 hari. Lihat `docs/auth.md`.
+        API key perangkat gudang terdaftar (`DEVICE_API_KEY_GUDANG`). Hak minimal: tulis `timbangan` dan
+        `fee.status_cetak`; tidak boleh membaca data pengguna dan tidak menggantikan bearer. Berlaku 90 hari;
+        saat rotasi kunci lama diberi tenggang 7 hari. Lihat `docs/auth.md`.
     serviceKey:
       type: apiKey
       in: header
@@ -1249,6 +1276,14 @@ components:
             $ref: '#/components/schemas/Galat'
           example:
             error: batas laju terlampaui
+    AkunTerkunci:
+      description: Akun terkunci 15 menit setelah 3 kali salah PIN (429); pesan memuat waktu berakhirnya kunci.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Galat'
+          example:
+            error: akun terkunci sampai 2026-10-10T07:30:00+00:00
     GalatServer:
       description: Galat basis data atau internal (500).
       content:
@@ -1783,16 +1818,17 @@ components:
     TerbitPapanRequest:
       type: object
       required: [uuid, berlaku_mulai, referensi]
+      additionalProperties: false
       properties:
         uuid:
           $ref: '#/components/schemas/UuidKlien'
         berlaku_mulai:
           type: string
           format: date
-          description: Hari Senin minggu berlaku.
+          description: Hari Senin minggu berlaku (selain Senin `422`); papan berlaku Senin sampai Minggu.
         referensi:
           type: array
-          description: Tiga harga pasar referensi per komoditas (Pasar Induk, pasar kota, eceran daring).
+          description: Tiga harga pasar referensi per komoditas (Pasar Induk, pasar kota, eceran daring); ketiga komoditas pilot wajib ada tepat sekali, harga lebih dari 0.
           items:
             type: object
             required: [komoditas, harga]
@@ -1880,6 +1916,9 @@ components:
           pattern: '^AUD-\d{8}-\d{3}$'
           examples: [AUD-20261009-003]
           description: ID audit (nama + waktu) yang tampil di dasbor.
+        duplikat:
+          type: boolean
+          description: true bila UUID klien sama sudah pernah diproses (hanya pada penulisan idempoten).
     Fee:
       type: object
       description: Rujukan skema fee per pesanan (`PSO-YYYYMMDD-NNN`); nominal = berat kg x tarif zona.
