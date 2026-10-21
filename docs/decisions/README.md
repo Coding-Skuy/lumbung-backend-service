@@ -13,3 +13,7 @@ Keputusan arsitektur repo ini dicatat sebagai ADR.
 ## Daftar
 
 - [ADR-0001 — Fondasi teknis](./ADR-0001-fondasi-teknis.md)
+- [ADR-0002 — Implementasi autentikasi LMB-BE-003](./ADR-0002-implementasi-auth.md)
+- [ADR-0003 — Skema lot, sortir, dan keranjang (LMB-BE-004)](./ADR-0003-skema-lot-sortir-keranjang.md)
+- [ADR-0004 — Trip, surat jalan, endpoint sopir, dan sinkron offline (LMB-BE-005)](./ADR-0004-trip-sopir-sinkron.md)
+- [ADR-0005 — Fee per kg, invoice mingguan, dan pembayaran petani H+1 (LMB-BE-006)](./ADR-0005-fee-invoice-pembayaran.md)
