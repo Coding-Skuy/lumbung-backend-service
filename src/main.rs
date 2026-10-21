@@ -1,38 +1,14 @@
 //! Titik masuk layanan backend Lumbung (Axum).
 //!
-//! Menyediakan router HTTP dan endpoint `GET /healthz` yang memeriksa
-//! konektivitas basis data `lumbung` sebelum menjawab `ok`.
+//! Menjalankan migrasi, mendaftarkan kunci perangkat gudang dari environment,
+//! lalu melayani router dari pustaka (`/healthz` dan API di bawah `/v1`).
 
-mod config;
-mod db;
-mod error;
-mod state;
+use lumbung_backend_service::{
+    auth::kunci, config::Config, db, invoice, router, state::AppState, waktu,
+};
 
-use std::time::Duration;
-
-use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
-use serde_json::{json, Value};
-use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
-
-use state::AppState;
-
-/// Endpoint kesehatan: menjawab `ok` hanya bila query ringan ke DB berhasil.
-async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(json!({ "status": "ok", "db": "lumbung" })))
-}
-
-fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
-        .layer(TimeoutLayer::new(Duration::from_secs(10)))
-        .with_state(state)
-}
+/// Label kunci perangkat gudang yang berasal dari `DEVICE_API_KEY_GUDANG`.
+const LABEL_GUDANG: &str = "GUDANG";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,15 +16,32 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let config = config::Config::from_env()?;
+    let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    kunci::pastikan_kunci_awal(&pool, LABEL_GUDANG, &config.device_api_key).await?;
 
-    let state = AppState::new(pool, config);
+    let state = AppState::new(pool, config)?;
+    // Invoice fee mingguan terbit tiap Senin; tugas latar menyusul invoice tertunda (idempoten).
+    let pool_invoice = state.pool.clone();
+    tokio::spawn(async move {
+        let mut tiap_jam = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tiap_jam.tick().await;
+            match invoice::terbitkan_tertunda(&pool_invoice, waktu::hari_ini_wib()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(jumlah = n, "invoice mingguan diterbitkan"),
+                Err(e) => tracing::error!(error = %e, "gagal menerbitkan invoice mingguan"),
+            }
+        }
+    });
     let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&state.config.listen_addr).await?;
-    tracing::info!("lumbung-backend-service menyala di {}", state.config.listen_addr);
+    tracing::info!(
+        "lumbung-backend-service menyala di {}",
+        state.config.listen_addr
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
